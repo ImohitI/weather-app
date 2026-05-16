@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Weather</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      min-height: 100vh;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+    }
+
+    .card {
+      background: rgba(255,255,255,0.07);
+      backdrop-filter: blur(16px);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 1.5rem;
+      padding: 2.5rem;
+      width: 100%;
+      max-width: 480px;
+      color: #fff;
+    }
+
+    h1 { font-size: 1.6rem; font-weight: 700; margin-bottom: 1.75rem; text-align: center; }
+
+    /* Provider pills */
+    .providers {
+      display: flex;
+      gap: .5rem;
+      margin-bottom: 1.25rem;
+      background: rgba(0,0,0,0.2);
+      padding: .35rem;
+      border-radius: .75rem;
+    }
+    .provider-btn {
+      flex: 1;
+      padding: .5rem;
+      border: none;
+      border-radius: .55rem;
+      cursor: pointer;
+      font-size: .82rem;
+      font-weight: 600;
+      color: rgba(255,255,255,0.55);
+      background: transparent;
+      transition: all .2s;
+    }
+    .provider-btn.active { color: #fff; }
+    .provider-btn[data-p="groq"].active       { background: #f55036; }
+    .provider-btn[data-p="openrouter"].active { background: #7c3aed; }
+    .provider-btn[data-p="huggingface"].active { background: #ff9a00; }
+
+    /* Model selector */
+    .model-select {
+      width: 100%;
+      margin-bottom: 1.25rem;
+      padding: .5rem .75rem;
+      border: 1px solid rgba(255,255,255,0.18);
+      border-radius: .75rem;
+      background: rgba(255,255,255,0.08);
+      color: #fff;
+      font-size: .88rem;
+      outline: none;
+      cursor: pointer;
+    }
+    .model-select option { background: #1a1a2e; color: #fff; }
+
+    /* Search row */
+    .search-row { display: flex; gap: .6rem; margin-bottom: 1.5rem; }
+    .search-row input {
+      flex: 1;
+      padding: .75rem 1rem;
+      border: 1px solid rgba(255,255,255,0.18);
+      border-radius: .75rem;
+      background: rgba(255,255,255,0.08);
+      color: #fff;
+      font-size: 1rem;
+      outline: none;
+      transition: border-color .2s;
+    }
+    .search-row input::placeholder { color: rgba(255,255,255,0.35); }
+    .search-row input:focus { border-color: rgba(255,255,255,0.5); }
+    .search-row button {
+      padding: .75rem 1.25rem;
+      border: none;
+      border-radius: .75rem;
+      background: rgba(255,255,255,0.15);
+      color: #fff;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: background .2s;
+    }
+    .search-row button:hover { background: rgba(255,255,255,0.25); }
+    .search-row button:disabled { opacity: .5; cursor: not-allowed; }
+
+    /* Result */
+    #result { display: none; }
+
+    .location {
+      text-align: center;
+      font-size: 1.2rem;
+      font-weight: 600;
+      margin-bottom: .25rem;
+    }
+    .temp-row {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: .75rem;
+      margin: .75rem 0;
+    }
+    .temp-big { font-size: 3.5rem; font-weight: 700; line-height: 1; }
+    .weather-icon { width: 64px; height: 64px; }
+    .description { text-align: center; color: rgba(255,255,255,0.7); text-transform: capitalize; }
+
+    .details {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: .6rem;
+      margin: 1.25rem 0;
+    }
+    .detail-box {
+      background: rgba(255,255,255,0.06);
+      border-radius: .65rem;
+      padding: .7rem 1rem;
+    }
+    .detail-label { font-size: .7rem; color: rgba(255,255,255,0.5); text-transform: uppercase; letter-spacing: .05em; }
+    .detail-value { font-size: 1.1rem; font-weight: 600; margin-top: .15rem; }
+
+    .summary-box {
+      background: rgba(255,255,255,0.06);
+      border-radius: .75rem;
+      padding: 1rem 1.1rem;
+      font-size: .92rem;
+      line-height: 1.55;
+      color: rgba(255,255,255,0.88);
+    }
+    .summary-label {
+      font-size: .7rem;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: rgba(255,255,255,0.4);
+      margin-bottom: .45rem;
+    }
+
+    /* Error / loading */
+    #status {
+      text-align: center;
+      padding: .6rem;
+      font-size: .9rem;
+      border-radius: .65rem;
+      margin-bottom: 1rem;
+      display: none;
+    }
+    #status.error   { background: rgba(239,68,68,0.2);  color: #fca5a5; display: block; }
+    #status.loading { background: rgba(255,255,255,0.06); color: rgba(255,255,255,0.6); display: block; }
+  </style>
+</head>
+<body>
+<div class="card">
+  <h1>🌤 AI Weather</h1>
+
+  <!-- Provider selector -->
+  <div class="providers">
+    <button class="provider-btn active" data-p="groq">Groq</button>
+    <button class="provider-btn" data-p="openrouter">OpenRouter</button>
+    <button class="provider-btn" data-p="huggingface">HuggingFace</button>
+  </div>
+
+  <!-- Model selector -->
+  <select id="model-select" class="model-select"></select>
+
+  <!-- City search -->
+  <div class="search-row">
+    <input id="city-input" type="text" placeholder="Enter city name…" />
+    <button id="search-btn" onclick="search()">Search</button>
+  </div>
+
+  <div id="status"></div>
+
+  <!-- Weather result -->
+  <div id="result">
+    <div class="location" id="res-location"></div>
+    <div class="temp-row">
+      <img class="weather-icon" id="res-icon" src="" alt="" />
+      <span class="temp-big" id="res-temp"></span>
+    </div>
+    <div class="description" id="res-desc"></div>
+
+    <div class="details">
+      <div class="detail-box">
+        <div class="detail-label">Feels like</div>
+        <div class="detail-value" id="res-feels"></div>
+      </div>
+      <div class="detail-box">
+        <div class="detail-label">Humidity</div>
+        <div class="detail-value" id="res-hum"></div>
+      </div>
+      <div class="detail-box">
+        <div class="detail-label">Wind</div>
+        <div class="detail-value" id="res-wind"></div>
+      </div>
+      <div class="detail-box">
+        <div class="detail-label">AI model</div>
+        <div class="detail-value" id="res-model"></div>
+      </div>
+    </div>
+
+    <div class="summary-box">
+      <div class="summary-label">AI Summary</div>
+      <div id="res-summary"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  let activeProvider = "groq";
+  let providerModels = {};
+
+  async function loadModels() {
+    const resp = await fetch("/api/models");
+    providerModels = await resp.json();
+    updateModelDropdown();
+  }
+
+  function updateModelDropdown() {
+    const select = document.getElementById("model-select");
+    select.innerHTML = "";
+    (providerModels[activeProvider] || []).forEach(m => {
+      const opt = document.createElement("option");
+      opt.value = m.id;
+      opt.textContent = m.label;
+      select.appendChild(opt);
+    });
+  }
+
+  // Provider pill switching
+  document.querySelectorAll(".provider-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".provider-btn").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      activeProvider = btn.dataset.p;
+      updateModelDropdown();
+    });
+  });
+
+  // Allow Enter key to trigger search
+  document.getElementById("city-input").addEventListener("keydown", e => {
+    if (e.key === "Enter") search();
+  });
+
+  function setStatus(msg, type) {
+    const el = document.getElementById("status");
+    el.textContent = msg;
+    el.className = type;
+  }
+
+  async function search() {
+    const city = document.getElementById("city-input").value.trim();
+    if (!city) return;
+
+    const model = document.getElementById("model-select").value;
+    const btn = document.getElementById("search-btn");
+    btn.disabled = true;
+    document.getElementById("result").style.display = "none";
+    setStatus("Fetching weather & asking AI…", "loading");
+
+    try {
+      const resp = await fetch("/api/weather", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ city, provider: activeProvider, model }),
+      });
+
+      const data = await resp.json();
+
+      if (!resp.ok) {
+        setStatus(data.error || "Something went wrong", "error");
+        return;
+      }
+
+      const modelLabel = (providerModels[data.provider] || []).find(m => m.id === data.model_id)?.label || data.model_id;
+
+      document.getElementById("res-location").textContent = `${data.city}, ${data.country}`;
+      document.getElementById("res-temp").textContent     = `${data.temp}°C`;
+      document.getElementById("res-feels").textContent    = `${data.feels_like}°C`;
+      document.getElementById("res-hum").textContent      = `${data.humidity}%`;
+      document.getElementById("res-wind").textContent     = `${data.wind_speed} m/s`;
+      document.getElementById("res-desc").textContent     = data.description;
+      document.getElementById("res-summary").textContent  = data.summary;
+      document.getElementById("res-model").textContent    = modelLabel;
+      document.getElementById("res-icon").src =
+        `https://openweathermap.org/img/wn/${data.icon_code}@2x.png`;
+
+      setStatus("", "");
+      document.getElementById("result").style.display = "block";
+
+    } catch {
+      setStatus("Network error — is the server running?", "error");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  loadModels();
+</script>
+</body>
+</html>

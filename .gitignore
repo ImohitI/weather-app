@@ -1,0 +1,17 @@
+# API keys — never commit this
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Claude Code internal
+.claude/
