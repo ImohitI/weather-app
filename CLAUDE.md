@@ -15,6 +15,9 @@ weather-app/
 ├── .env.example           ← template for API keys (copy → .env)
 ├── .env                   ← actual keys (gitignored, never commit)
 ├── .gitignore             ← excludes .env, venv/, __pycache__, .claude/
+├── .github/
+│   └── workflows/
+│       └── tests.yml      ← GitHub Actions: runs 34 unit tests on every push to main
 └── templates/
     └── index.html         ← dark glassmorphism UI, provider + model switcher
 ```
@@ -66,6 +69,13 @@ PROVIDER_MODELS = {
 }
 ```
 `litellm` handles the unified interface — reads API keys from env automatically.
+
+## CI — GitHub Actions
+- Workflow at `.github/workflows/tests.yml`
+- Triggers on every push and pull request to `main`
+- Runs `python -m pytest test_app.py -v` (34 tests)
+- Sets `OPENWEATHER_API_KEY=dummy_key_for_tests` as env var — required because the app checks for the key before reaching mocked code; the actual value is never used in tests
+- Results visible at: github.com/ImohitI/weather-app → Actions tab
 
 ## Key decisions made during development
 - **Dropped Claude/OpenAI/Gemini** — replaced with free providers (Groq, HuggingFace, OpenRouter)
