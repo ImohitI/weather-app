@@ -22,7 +22,11 @@
 - [x] 9 cache tests covering hit/miss/partial, call counts, case-insensitivity, coherence, TTL expiry
 - [ ] Evolve to Redis so cache is shared across gunicorn workers (prerequisite for item #6)
 
-**Key decision:** Cache the expensive derived result (LLM), not just the cheap source (weather API). Key on a weather hash so consistency is guaranteed by construction, not by TTL math.
+**Key decisions:**
+- Cache the expensive derived result (LLM), not just the cheap source (weather API)
+- Key on a weather hash so consistency is guaranteed by construction, not by TTL math
+- Weather TTL (10 min) = freshness policy — how long is the fact still true?
+- LLM TTL (1 hr) = eviction policy — garbage collection only; hash already handles staleness. Could be 24h with zero correctness impact.
 
 **Remaining limitation:** in-process dicts are not shared across workers — Redis needed for true horizontal scaling (tracked in item #6).
 

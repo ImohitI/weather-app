@@ -51,6 +51,44 @@ python -m pytest test_app.py -v
 5. Backend returns JSON; frontend renders weather card + AI summary
 6. `/api/models` endpoint returns available models per provider for the dropdown
 
+## Full request lifecycle
+
+### Phase 1 — Page load
+| Step | What happens |
+|---|---|
+| `GET /` | Flask `index()` returns rendered `index.html` via Jinja2 |
+| Script executes | JS initializes `activeProvider = "groq"`, attaches event listeners |
+| `GET /api/models` | JS fires immediately; backend reshapes `PROVIDER_MODELS` dict → JSON |
+| Dropdown populated | JS stores response in `providerModels`, builds `<select>` options |
+
+`/api/models` is called once on page load and cached in JS memory. Provider switching never hits the network — it just re-renders the dropdown from `providerModels`.
+
+### Phase 2 — Search request
+| Step | What happens |
+|---|---|
+| `search()` | JS disables button, hides previous result, calls `fetch("/api/weather", POST)` |
+| WSGI | Gunicorn worker (or Werkzeug dev server) reads TCP bytes, calls Flask WSGI callable |
+| Routing | Flask O(1) URL map lookup → `get_weather()` |
+| Body parse | `request.get_json(silent=True)` → `json.loads()` on raw bytes |
+| Validation | 4 guard clauses (empty city, unknown provider, missing API key) — all short-circuit |
+| Tier 1 cache | `_cache_get(_weather_cache, city.lower())` — O(1) dict lookup + float TTL comparison |
+| Weather fetch (miss) | `requests.get()` → DNS → TCP pool → TLS → HTTP → `resp.raise_for_status()` → `resp.json()` |
+| Hash | `_weather_hash()` MD5s 5 prompt-relevant fields, takes first 8 hex chars |
+| Tier 2 cache | `_cache_get(_llm_cache, "city:provider:model:hash")` |
+| LLM call (miss) | `litellm.completion()` → reads env key → HTTPS POST to provider API → 1-5s |
+| Response | `jsonify()` + `X-Cache` header (HIT / PARTIAL / MISS) |
+| DOM update | JS writes 10 elements; browser fetches icon PNG from OWM CDN separately |
+
+### WSGI and worker model
+- **Dev** (`python app.py`): single Werkzeug process — one request at a time
+- **Prod** (`gunicorn app:app`): pre-forked worker processes — each has its own `_weather_cache` / `_llm_cache` in memory, not shared. This is why Redis is needed for horizontal scaling (TODO #6)
+
+### What `litellm` does
+Unified wrapper over multiple provider APIs. Parses the model prefix (`groq/`, `huggingface/`, `openrouter/`), reads the matching `*_API_KEY` from env, translates the OpenAI-style `messages` format into the provider's actual request format, and returns a response object with the same shape regardless of provider.
+
+### Why `icon_code` is a code not a URL
+Backend returns `"10d"` — the browser constructs `https://openweathermap.org/img/wn/10d@2x.png` and fetches it directly from OWM's CDN. Backend never touches the image.
+
 ## LLM providers and models (app.py)
 ```python
 PROVIDER_MODELS = {
@@ -88,8 +126,15 @@ Two in-process dicts act as independent cache tiers. In production, both would b
 
 ### Tier 2 — LLM summary
 - **Key:** `city:provider:model:<weather_hash>`
-- **TTL:** 1 hour (generous, hash handles staleness)
+- **TTL:** 1 hour — purely a memory eviction policy, not a freshness policy
 - **Why:** LLM calls are 10–20× slower and token-expensive
+
+### TTL purpose differs per tier
+The two TTLs serve completely different concerns:
+- **Weather TTL** = freshness policy — how long is this fact still true? (OpenWeatherMap updates ~every 10 min)
+- **LLM TTL** = eviction policy — how long do we keep this entry in memory if nobody asks for it again?
+
+The LLM cache needs no freshness TTL because the hash handles that. If weather changes → hash changes → old LLM entry is unreachable, never served again. It just leaks memory without a TTL. You could set LLM TTL to 24h or a week with zero correctness impact.
 
 ### Weather hash
 `_weather_hash(weather)` MD5s only the five fields that appear in the prompt
