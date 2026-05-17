@@ -10,14 +10,16 @@ A Flask web app that fetches real weather data from OpenWeatherMap and uses an L
 ```
 weather-app/
 ├── app.py                 ← Flask backend: weather fetch + multi-LLM routing
+├── models.json            ← provider + model config (edit here, not in app.py)
+├── update_models.py       ← maintenance script: discover + live-test free models, rewrite models.json
 ├── requirements.txt       ← flask, requests, litellm, python-dotenv, gunicorn
-├── test_app.py            ← 34 unit tests (mocked, no API calls needed)
+├── test_app.py            ← 63 unit tests (mocked, no API calls needed)
 ├── .env.example           ← template for API keys (copy → .env)
 ├── .env                   ← actual keys (gitignored, never commit)
 ├── .gitignore             ← excludes .env, venv/, __pycache__, .claude/
 ├── .github/
 │   └── workflows/
-│       └── tests.yml      ← GitHub Actions: runs 34 unit tests on every push to main
+│       └── tests.yml      ← GitHub Actions: runs 63 unit tests on every push to main
 └── templates/
     └── index.html         ← dark glassmorphism UI, provider + model switcher
 ```
@@ -123,30 +125,51 @@ Unified wrapper over multiple provider APIs. Parses the model prefix (`groq/`, `
 ### Why `icon_code` is a code not a URL
 Backend returns `"10d"` — the browser constructs `https://openweathermap.org/img/wn/10d@2x.png` and fetches it directly from OWM's CDN. Backend never touches the image.
 
-## LLM providers and models (app.py)
+## LLM providers and models (models.json)
+
+Model config lives in `models.json`, not in `app.py`. `app.py` loads it once at startup:
 ```python
-PROVIDER_MODELS = {
-    "groq": {
-        "default": "groq/llama-3.3-70b-versatile",
-        "models": [Llama 3.3 70B, Llama 3.1 8B, Llama 4 Scout, Qwen3 32B]
-    },
-    "openrouter": {
-        "default": "openrouter/meta-llama/llama-3.1-8b-instruct:free",
-        "models": [Llama 3.1 8B, Mistral 7B, Gemma 3 1B, Phi-3 Mini]
-    },
-    "huggingface": {
-        "default": "huggingface/Qwen/Qwen2.5-7B-Instruct",
-        "models": [Qwen 2.5 7B, Gemma 2 2B, Llama 3.2 1B]
-    },
-}
+with open("models.json") as f:
+    PROVIDER_MODELS = json.load(f)
 ```
+
+Current verified working models:
+```
+groq:        Llama 3.3 70B (default), Llama 3.1 8B, Llama 4 Scout, Qwen3 32B
+openrouter:  Nemotron 120B (default), Gemma 4 31B, LFM 2.5 1.2B, MiniMax M2.5
+huggingface: Qwen 2.5 7B (default), Gemma 2 2B, Llama 3.2 1B
+```
+
 `litellm` handles the unified interface — reads API keys from env automatically.
+
+### Refreshing models when they break
+
+```bash
+python update_models.py                      # test all providers, rewrite models.json
+python update_models.py --provider openrouter  # one provider only
+git add models.json && git commit -m "refresh model list" && git push
+```
+
+`update_models.py` fetches each provider's model list from their API (OpenRouter and Groq have listing endpoints; HuggingFace does not so a curated candidate list is maintained in the script), live-tests every candidate with a real prompt, and keeps only those that respond. The default is preserved if it still passes; otherwise the first passing model becomes the new default.
+
+### Per-provider API key validation
+
+`app.py` loads all four keys at module level and checks the selected provider's key before touching any cache or making any API call:
+
+```python
+GROQ_API_KEY        = os.getenv("GROQ_API_KEY")
+OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY")
+HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
+```
+
+If a key is missing the response is `500: OPENROUTER_API_KEY is not set` (naming the exact variable) rather than a cryptic litellm 502. Check order in `get_weather()`: rate limit → OPENWEATHER key → provider key → cache → fetch.
 
 ## CI — GitHub Actions
 - Workflow at `.github/workflows/tests.yml`
 - Triggers on every push and pull request to `main`
-- Runs `python -m pytest test_app.py -v` (34 tests)
+- Runs `python -m pytest test_app.py -v` (63 tests)
 - Sets `OPENWEATHER_API_KEY=dummy_key_for_tests` as env var — required because the app checks for the key before reaching mocked code; the actual value is never used in tests
+- `models.json` is committed to the repo so CI can load `PROVIDER_MODELS` at import time without any API calls
 - Results visible at: github.com/ImohitI/weather-app → Actions tab
 
 ## Database design (SQLite, query history)
@@ -273,6 +296,10 @@ describing yesterday's rain during today's sunshine are impossible.
 - **Groq model changes** — Mixtral 8x7B, Gemma2 9B, DeepSeek R1, QwQ 32B all decommissioned; replaced with active models verified via Groq API
 - **HuggingFace model selection** — many models not chat-compatible; Qwen2.5-7B, Gemma-2-2B, Llama-3.2-1B confirmed working
 - **gunicorn added** to requirements.txt for production deployment (Flask dev server not suitable)
+- **OpenRouter models decommissioned** — original 4 models (Llama 3.1 8B, Mistral 7B, Gemma 3 1B, Phi-3 Mini) all returned 404; replaced with live-tested working models (Nemotron 120B, Gemma 4 31B, LFM 2.5 1.2B, MiniMax M2.5)
+- **models.json extracted from app.py** — model lists change independently of application logic; keeping them in a separate config file means model updates are a one-command refresh (`python update_models.py`) + JSON commit rather than touching and re-testing application code
+- **Per-provider API key pre-flight check** — previously a missing LLM key produced a cryptic litellm 502; now returns a clear `500: OPENROUTER_API_KEY is not set` naming the exact variable, consistent with how OPENWEATHER_API_KEY is handled
+- **Render env var typo** — `OPENROUTE_API_KEY` (missing R) caused all OpenRouter calls to fail silently; corrected to `OPENROUTER_API_KEY`
 
 ## Deployment (Render)
 - **Platform:** render.com (free tier)
@@ -300,11 +327,15 @@ Render picks up the push and redeploys automatically.
 | HuggingFace | Qwen 2.5 7B | ✅ |
 | HuggingFace | Gemma 2 2B | ✅ |
 | HuggingFace | Llama 3.2 1B | ✅ |
-| OpenRouter | All 4 | ⚠️ Needs OPENROUTER_API_KEY in Render env vars |
+| OpenRouter | Nemotron 120B | ✅ |
+| OpenRouter | Gemma 4 31B | ✅ |
+| OpenRouter | LFM 2.5 1.2B | ✅ |
+| OpenRouter | MiniMax M2.5 | ✅ |
 
 ## Potential next steps
-- Add OPENROUTER_API_KEY to Render environment variables and verify
+- Add history UI panel (backend `/api/history` exists, no frontend for it yet)
 - Add a loading spinner
 - Add °C / °F toggle
 - Add 5-day forecast section
 - Add error boundary for cold start delay on Render
+- Redis for shared cache + rate limit store across gunicorn workers (current in-process dicts not shared)

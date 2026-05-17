@@ -221,11 +221,15 @@ class TestWeatherHappyPath:
     @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
     @patch("app.fetch_weather", return_value=MOCK_WEATHER)
     def test_uses_specified_model(self, _weather, _llm, client):
-        model = "groq/llama-3.1-8b-instant"
+        # pick any valid non-default Groq model so the test survives model list updates
+        non_default = next(
+            m["id"] for m in PROVIDER_MODELS["groq"]["models"]
+            if m["id"] != PROVIDER_MODELS["groq"]["default"]
+        )
         data = resp_json(client.post("/api/weather", json={
-            "city": "London", "provider": "groq", "model": model
+            "city": "London", "provider": "groq", "model": non_default
         }))
-        assert data["model_id"] == model
+        assert data["model_id"] == non_default
 
     @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
     @patch("app.fetch_weather", return_value=MOCK_WEATHER)
