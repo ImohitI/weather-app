@@ -51,6 +51,40 @@ python -m pytest test_app.py -v
 5. Backend returns JSON; frontend renders weather card + AI summary
 6. `/api/models` endpoint returns available models per provider for the dropdown
 
+## Client-server split — why logic lives in two files
+
+Two physically separate machines are involved on every request:
+
+```
+Browser (client)                 Server (Render / localhost)
+────────────────                 ───────────────────────────
+index.html <script>              app.py
+JavaScript                       Python
+Runs on user's machine           Runs on the server
+Owns: DOM, events, rendering     Owns: API keys, shared cache, external calls
+```
+
+**Python owns what only the server should touch:**
+- API keys — if these ran in JS they'd be visible in browser DevTools to anyone
+- `_weather_cache` / `_llm_cache` — shared across all users; must live in one place
+- External API calls (OWM, Groq, HuggingFace) — called server-to-server, not from browser
+- Input validation that users shouldn't be able to bypass
+
+**JavaScript owns what only the browser can do:**
+- DOM updates — showing/hiding the result card, writing weather values
+- User events — button clicks, Enter key, provider pill switching
+- `updateModelDropdown()` — rebuilds `<select>` on provider switch with zero network calls
+- Button disable during request — prevents double-submit
+- `<img src>` assignment — browser fetches the OWM icon from CDN natively
+
+**The contract between them — two endpoints only:**
+```
+GET  /api/models   →  called once on page load, stored in JS providerModels
+POST /api/weather  →  called on each search, response rendered into DOM
+```
+
+Neither side knows how the other is implemented. Rule: **secrets + shared state → server. Events + rendering → browser.**
+
 ## Full request lifecycle
 
 ### Phase 1 — Page load
