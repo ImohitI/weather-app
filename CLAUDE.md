@@ -149,6 +149,31 @@ PROVIDER_MODELS = {
 - Sets `OPENWEATHER_API_KEY=dummy_key_for_tests` as env var — required because the app checks for the key before reaching mocked code; the actual value is never used in tests
 - Results visible at: github.com/ImohitI/weather-app → Actions tab
 
+## Rate limiting (sliding window, per IP)
+
+Implemented on `POST /api/weather` only — the only endpoint that hits external APIs.
+
+**Algorithm — sliding window:**
+- `_rate_limit_store: dict` maps `ip -> [timestamp, ...]`
+- On each request: prune timestamps older than `RATE_WINDOW`, count remaining, append if allowed
+- Limit: 10 requests per 60-second window per IP
+
+**Why sliding window over token bucket:**
+Token bucket resets the full quota every N seconds — a user can burn all 10 requests in 1 second, wait 59s, repeat. Sliding window tracks each timestamp individually so the quota rolls smoothly with no burst exploitation.
+
+**Client IP extraction:**
+```python
+client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+client_ip = client_ip.split(",")[0].strip()
+```
+Behind Render's proxy, `REMOTE_ADDR` is always the proxy IP. `X-Forwarded-For` carries the real client IP. Split on `,` because the header can be a chain (`client, proxy1, proxy2`).
+
+**Response on limit exceeded:** `429 Too Many Requests` + `Retry-After: N` header. `N = int(timestamps[0] + RATE_WINDOW - now) + 1` — seconds until the oldest timestamp rolls out of the window.
+
+**Rate check is the first thing in `get_weather()`** — blocked requests do zero work (no body parsing, no cache lookup, no API calls).
+
+**Known limitation:** `_rate_limit_store` is in-process — not shared across gunicorn workers. Effective limit is `RATE_LIMIT × num_workers`. Fix: Redis atomic increment + TTL (same fix as caching, tracked in TODO #6).
+
 ## Caching strategy (two-tier, hash-based coherence)
 
 Two in-process dicts act as independent cache tiers. In production, both would be Redis.

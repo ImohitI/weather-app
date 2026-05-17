@@ -2,7 +2,7 @@
 
 ## Progress
 - [x] 1. Caching
-- [ ] 2. Rate Limiting
+- [x] 2. Rate Limiting
 - [ ] 3. Database Design
 - [ ] 4. Async Processing & Queues
 - [ ] 5. Circuit Breaker / Fallback
@@ -34,12 +34,21 @@
 
 ---
 
-## 2. Rate Limiting
+## 2. Rate Limiting ✅
 **Concept:** Protect your service and downstream APIs.
 
-- [ ] Implement per-IP rate limiting on `/api/weather` using token bucket algorithm
-- [ ] Return `429 Too Many Requests` with a `Retry-After` header
-- [ ] Write tests for rate limit behavior
+- [x] Sliding window algorithm — `_rate_limit_store: ip -> [timestamps]`, prune on every read
+- [x] 10 requests per 60-second window per IP
+- [x] Client IP from `X-Forwarded-For` (Render proxy) with fallback to `REMOTE_ADDR`
+- [x] Returns `429` + `Retry-After: N` header (seconds until oldest timestamp exits window)
+- [x] Rate check is first thing in `get_weather()` — blocked requests do zero work
+- [x] 7 tests: within limit, over limit, Retry-After header, error message, IP independence, expired timestamps, check fires before body parsing
+
+**Algorithm — sliding window vs token bucket:**
+- Token bucket resets full quota every N seconds — users can burst all 10 in 1 second, wait 59s, repeat
+- Sliding window tracks each timestamp individually — quota rolls smoothly, no burst exploitation
+
+**Known limitation:** `_rate_limit_store` is in-process — not shared across gunicorn workers. Each worker has its own counter, so the effective limit is `RATE_LIMIT × num_workers`. Fix: Redis with atomic increment + TTL (tracked in item #6).
 
 **Interview talking point:** "How would you prevent abuse and API cost blowout?"
 

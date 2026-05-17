@@ -17,6 +17,7 @@ def client():
     app.config["TESTING"] = True
     app_module._weather_cache.clear()
     app_module._llm_cache.clear()
+    app_module._rate_limit_store.clear()
     with app.test_client() as c:
         yield c
 
@@ -368,6 +369,74 @@ class TestCaching:
         resp = client.post("/api/weather", json={"city": "London", "provider": "groq"})
         assert resp.headers.get("X-Cache") == "MISS"
         assert mock_weather.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting — sliding window, per IP
+# ---------------------------------------------------------------------------
+
+class TestRateLimiting:
+    @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
+    @patch("app.fetch_weather", return_value=MOCK_WEATHER)
+    def test_requests_within_limit_return_200(self, _w, _l, client):
+        for _ in range(10):
+            resp = client.post("/api/weather", json={"city": "London", "provider": "groq"})
+            assert resp.status_code == 200
+
+    @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
+    @patch("app.fetch_weather", return_value=MOCK_WEATHER)
+    def test_exceeding_limit_returns_429(self, _w, _l, client):
+        for _ in range(10):
+            client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        resp = client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        assert resp.status_code == 429
+
+    @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
+    @patch("app.fetch_weather", return_value=MOCK_WEATHER)
+    def test_429_has_retry_after_header(self, _w, _l, client):
+        for _ in range(10):
+            client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        resp = client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        assert "Retry-After" in resp.headers
+        assert int(resp.headers["Retry-After"]) > 0
+
+    @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
+    @patch("app.fetch_weather", return_value=MOCK_WEATHER)
+    def test_429_has_error_message(self, _w, _l, client):
+        for _ in range(10):
+            client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        resp = client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        assert "Rate limit" in resp_json(resp)["error"]
+
+    @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
+    @patch("app.fetch_weather", return_value=MOCK_WEATHER)
+    def test_different_ips_are_independent(self, _w, _l, client):
+        for _ in range(10):
+            client.post("/api/weather", json={"city": "London", "provider": "groq"},
+                        environ_overrides={"REMOTE_ADDR": "1.2.3.4"})
+        # Different IP should not be rate limited
+        resp = client.post("/api/weather", json={"city": "London", "provider": "groq"},
+                           environ_overrides={"REMOTE_ADDR": "5.6.7.8"})
+        assert resp.status_code == 200
+
+    @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
+    @patch("app.fetch_weather", return_value=MOCK_WEATHER)
+    def test_expired_timestamps_do_not_count(self, _w, _l, client):
+        # Plant 10 timestamps already outside the window
+        old = time.time() - app_module.RATE_WINDOW - 1
+        app_module._rate_limit_store["127.0.0.1"] = [old] * 10
+        resp = client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        assert resp.status_code == 200
+
+    @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
+    @patch("app.fetch_weather", return_value=MOCK_WEATHER)
+    def test_rate_limit_is_checked_before_body_parsing(self, _w, _l, client):
+        # Exhaust limit, then send malformed body — should still get 429, not 400
+        for _ in range(10):
+            client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        resp = client.post("/api/weather", data="not json",
+                           content_type="application/json")
+        assert resp.status_code == 429
 
 
 # ---------------------------------------------------------------------------

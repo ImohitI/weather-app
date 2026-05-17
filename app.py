@@ -37,6 +37,30 @@ def _cache_set(cache: dict, key: str, value, ttl: int):
     cache[key] = (value, time.time() + ttl)
 
 
+# Sliding-window rate limiter: ip -> [timestamp, ...]
+_rate_limit_store: dict = {}
+RATE_LIMIT  = 10   # max requests per window per IP
+RATE_WINDOW = 60   # window size in seconds
+
+
+def _is_rate_limited(ip: str) -> tuple[bool, int]:
+    now          = time.time()
+    window_start = now - RATE_WINDOW
+
+    # Keep only timestamps inside the current window (lazy cleanup)
+    timestamps = [t for t in _rate_limit_store.get(ip, []) if t > window_start]
+
+    if len(timestamps) >= RATE_LIMIT:
+        # Seconds until the oldest request rolls out of the window
+        retry_after = int(timestamps[0] + RATE_WINDOW - now) + 1
+        _rate_limit_store[ip] = timestamps
+        return True, retry_after
+
+    timestamps.append(now)
+    _rate_limit_store[ip] = timestamps
+    return False, 0
+
+
 def _weather_hash(weather: dict) -> str:
     """Short hash of the fields that appear in the LLM prompt."""
     relevant = {
@@ -119,6 +143,15 @@ def get_models():
 
 @app.route("/api/weather", methods=["POST"])
 def get_weather():
+    # Rate limit before any parsing — blocked requests do zero work
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    client_ip = client_ip.split(",")[0].strip()  # X-Forwarded-For can be comma-separated
+    limited, retry_after = _is_rate_limited(client_ip)
+    if limited:
+        resp = jsonify({"error": "Rate limit exceeded. Try again later."})
+        resp.headers["Retry-After"] = str(retry_after)
+        return resp, 429
+
     body = request.get_json(silent=True) or {}
     city = body.get("city", "").strip()
     provider = body.get("provider", "groq")
