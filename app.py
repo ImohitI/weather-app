@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import sqlite3
 import hashlib
 import requests
 import litellm
@@ -10,6 +11,49 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
+
+# Database — SQLite, path is overridden in tests to a temp file
+DATABASE = "history.db"
+
+
+def _init_db():
+    conn = sqlite3.connect(DATABASE)
+    try:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS query_history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                city        TEXT    NOT NULL,
+                country     TEXT    NOT NULL,
+                provider    TEXT    NOT NULL,
+                model_id    TEXT    NOT NULL,
+                temp        REAL    NOT NULL,
+                description TEXT    NOT NULL,
+                summary     TEXT    NOT NULL,
+                timestamp   TEXT    NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_city      ON query_history(city);
+            CREATE INDEX IF NOT EXISTS idx_timestamp ON query_history(timestamp);
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _save_history(city, country, provider, model_id, temp, description, summary):
+    conn = sqlite3.connect(DATABASE)
+    try:
+        conn.execute(
+            "INSERT INTO query_history "
+            "(city, country, provider, model_id, temp, description, summary) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (city, country, provider, model_id, temp, description, summary),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+_init_db()
 
 # Two-tier cache
 # Tier 1 — raw weather data: city.lower() -> (weather_dict, expires_at)
@@ -133,6 +177,45 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/api/history")
+def get_history():
+    page       = request.args.get("page", 1, type=int)
+    per_page   = min(request.args.get("per_page", 10, type=int), 50)  # cap at 50
+    city_query = request.args.get("city", "").strip()
+    offset     = (page - 1) * per_page
+
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    try:
+        if city_query:
+            pattern = f"%{city_query}%"
+            total = conn.execute(
+                "SELECT COUNT(*) FROM query_history WHERE city LIKE ?", (pattern,)
+            ).fetchone()[0]
+            rows = conn.execute(
+                "SELECT city, country, provider, model_id, temp, description, summary, timestamp "
+                "FROM query_history WHERE city LIKE ? ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                (pattern, per_page, offset),
+            ).fetchall()
+        else:
+            total = conn.execute("SELECT COUNT(*) FROM query_history").fetchone()[0]
+            rows = conn.execute(
+                "SELECT city, country, provider, model_id, temp, description, summary, timestamp "
+                "FROM query_history ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                (per_page, offset),
+            ).fetchall()
+    finally:
+        conn.close()
+
+    return jsonify({
+        "items":    [dict(r) for r in rows],
+        "total":    total,
+        "page":     page,
+        "pages":    (total + per_page - 1) // per_page,
+        "per_page": per_page,
+    })
+
+
 @app.route("/api/models")
 def get_models():
     return jsonify({
@@ -229,6 +312,21 @@ def get_weather():
         "model_id": model_id,
     })
     resp.headers["X-Cache"] = cache_status
+
+    # Persist to history — non-critical, never fail a user request over a DB error
+    try:
+        _save_history(
+            city=weather["name"],
+            country=weather["sys"]["country"],
+            provider=provider,
+            model_id=model_id,
+            temp=round(weather["main"]["temp"], 1),
+            description=weather["weather"][0]["description"].title(),
+            summary=summary,
+        )
+    except Exception:
+        pass
+
     return resp
 
 

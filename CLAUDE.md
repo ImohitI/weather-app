@@ -149,6 +149,48 @@ PROVIDER_MODELS = {
 - Sets `OPENWEATHER_API_KEY=dummy_key_for_tests` as env var — required because the app checks for the key before reaching mocked code; the actual value is never used in tests
 - Results visible at: github.com/ImohitI/weather-app → Actions tab
 
+## Database design (SQLite, query history)
+
+### Schema
+```sql
+CREATE TABLE query_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    city        TEXT    NOT NULL,
+    country     TEXT    NOT NULL,
+    provider    TEXT    NOT NULL,
+    model_id    TEXT    NOT NULL,
+    temp        REAL    NOT NULL,
+    description TEXT    NOT NULL,
+    summary     TEXT    NOT NULL,
+    timestamp   TEXT    NOT NULL DEFAULT (datetime('now'))  -- UTC, second precision
+);
+CREATE INDEX idx_city      ON query_history(city);
+CREATE INDEX idx_timestamp ON query_history(timestamp);
+```
+
+`id` is a surrogate key (AUTOINCREMENT) — rows have no natural unique identifier.
+`timestamp` is stored as TEXT in SQLite (`YYYY-MM-DD HH:MM:SS` UTC) — SQLite has no native DATETIME type; it stores date/time as text, integer, or real.
+
+### Indexes — why these two
+- `idx_city` — used by `WHERE city LIKE ?` in the city filter
+- `idx_timestamp` — used by `ORDER BY timestamp DESC` in every paginated query. Without it, every page fetch full-scans and sorts the whole table.
+
+### `_save_history()` — non-critical write
+Called at the end of every successful `get_weather()` response, wrapped in bare `try/except: pass`. History is observability — a disk-full or schema error must never turn a 200 into a 500 for the user.
+
+### `GET /api/history` — paginated endpoint
+Query params: `?page=1&per_page=10&city=London`
+- `per_page` capped at 50 server-side — clients can't request unbounded result sets
+- `city` filter uses `LIKE %query%` — partial, case-insensitive match (SQLite LIKE is case-insensitive for ASCII by default)
+- Returns: `{ items, total, page, pages, per_page }`
+- `pages = (total + per_page - 1) // per_page` — integer ceiling division, works correctly when total=0
+
+### `conn.row_factory = sqlite3.Row`
+Set on read connections only. Makes each result row subscriptable like a dict. `dict(row)` then produces a clean JSON-serializable object for `jsonify()`. Not set on write connections (unnecessary overhead).
+
+### Test isolation
+`DATABASE` is a module-level variable. Tests override it to a `tempfile.mkstemp()` path, call `_init_db()` to create the schema there, and `os.unlink()` after. The real `history.db` is gitignored and never touched by tests.
+
 ## Rate limiting (sliding window, per IP)
 
 Implemented on `POST /api/weather` only — the only endpoint that hits external APIs.

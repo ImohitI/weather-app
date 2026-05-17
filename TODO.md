@@ -3,7 +3,7 @@
 ## Progress
 - [x] 1. Caching
 - [x] 2. Rate Limiting
-- [ ] 3. Database Design
+- [x] 3. Database Design
 - [ ] 4. Async Processing & Queues
 - [ ] 5. Circuit Breaker / Fallback
 - [ ] 6. Horizontal Scaling & Statelessness
@@ -54,13 +54,23 @@
 
 ---
 
-## 3. Database Design
+## 3. Database Design ✅
 **Concept:** Schema design, indexing, reads vs writes.
 
-- [ ] Add SQLite to store query history (`city`, `provider`, `model`, `summary`, `timestamp`)
-- [ ] Add a `/api/history` endpoint with pagination
-- [ ] Add indexes on `city` and `timestamp`; measure query speed with/without
-- [ ] Migrate schema cleanly (understand migrations vs. drop-and-recreate)
+- [x] SQLite via stdlib `sqlite3` — no new dependency
+- [x] Table: `query_history (id, city, country, provider, model_id, temp, description, summary, timestamp)`
+- [x] Indexes on `city` and `timestamp` for fast filtering and ordering
+- [x] `GET /api/history` — paginated (default 10, capped at 50), filterable by `?city=`
+- [x] `_save_history()` called after every successful response — wrapped in `try/except` so a DB error never fails a user request
+- [x] `DATABASE` is a module-level variable — overridden in tests to a temp file so tests never touch `history.db`
+- [x] 9 tests: empty DB, save on success, pagination (p1+p2), city filter, partial match, per_page cap, response shape, no save on LLM error
+
+**Key decisions:**
+- `_save_history` wrapped in bare `except` — history is a nice-to-have, never a request blocker
+- `per_page` capped at 50 server-side — clients can't request unbounded result sets
+- `LIKE %query%` for city filter — partial, case-insensitive match (SQLite LIKE is case-insensitive for ASCII by default)
+- `datetime('now')` in SQLite — UTC timestamp, second precision
+- `conn.row_factory = sqlite3.Row` on reads — lets `dict(row)` work cleanly for JSON serialization
 
 **Interview talking point:** "Design the schema for a weather history feature"
 

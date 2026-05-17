@@ -1,4 +1,6 @@
 import json
+import os
+import tempfile
 import time
 import pytest
 from unittest.mock import MagicMock, patch
@@ -18,8 +20,17 @@ def client():
     app_module._weather_cache.clear()
     app_module._llm_cache.clear()
     app_module._rate_limit_store.clear()
+
+    # Isolated temp DB per test — never touches history.db
+    db_fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(db_fd)
+    app_module.DATABASE = db_path
+    app_module._init_db()
+
     with app.test_client() as c:
         yield c
+
+    os.unlink(db_path)
 
 
 MOCK_WEATHER = {
@@ -437,6 +448,81 @@ class TestRateLimiting:
         resp = client.post("/api/weather", data="not json",
                            content_type="application/json")
         assert resp.status_code == 429
+
+
+# ---------------------------------------------------------------------------
+# Database — query history
+# ---------------------------------------------------------------------------
+
+def _insert(client, city="London", country="GB", provider="groq",
+            model_id="groq/llama-3.3-70b-versatile", temp=15.0,
+            description="Light Rain", summary="Grab a jacket."):
+    app_module._save_history(city, country, provider, model_id, temp, description, summary)
+
+
+class TestHistory:
+    def test_empty_on_fresh_db(self, client):
+        data = resp_json(client.get("/api/history"))
+        assert data["items"] == []
+        assert data["total"] == 0
+        assert data["pages"] == 0
+
+    @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
+    @patch("app.fetch_weather", return_value=MOCK_WEATHER)
+    def test_weather_request_saves_to_history(self, _w, _l, client):
+        client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        data = resp_json(client.get("/api/history"))
+        assert data["total"] == 1
+        assert data["items"][0]["city"] == "London"
+        assert data["items"][0]["provider"] == "groq"
+
+    def test_pagination_page1(self, client):
+        for i in range(15):
+            _insert(client, city=f"City{i}")
+        data = resp_json(client.get("/api/history?page=1&per_page=10"))
+        assert len(data["items"]) == 10
+        assert data["total"] == 15
+        assert data["pages"] == 2
+
+    def test_pagination_page2(self, client):
+        for i in range(15):
+            _insert(client, city=f"City{i}")
+        data = resp_json(client.get("/api/history?page=2&per_page=10"))
+        assert len(data["items"]) == 5
+
+    def test_filter_by_city(self, client):
+        _insert(client, city="London")
+        _insert(client, city="Paris")
+        data = resp_json(client.get("/api/history?city=London"))
+        assert data["total"] == 1
+        assert data["items"][0]["city"] == "London"
+
+    def test_filter_is_case_insensitive_partial_match(self, client):
+        _insert(client, city="London")
+        _insert(client, city="New London")
+        data = resp_json(client.get("/api/history?city=london"))
+        assert data["total"] == 2
+
+    def test_per_page_capped_at_50(self, client):
+        for i in range(60):
+            _insert(client, city=f"City{i}")
+        data = resp_json(client.get("/api/history?per_page=100"))
+        assert len(data["items"]) == 50
+
+    def test_response_shape(self, client):
+        _insert(client)
+        data = resp_json(client.get("/api/history"))
+        item = data["items"][0]
+        for field in ("city", "country", "provider", "model_id", "temp",
+                      "description", "summary", "timestamp"):
+            assert field in item, f"missing field: {field}"
+
+    def test_llm_error_does_not_save_to_history(self, client):
+        with patch("app.fetch_weather", return_value=MOCK_WEATHER), \
+             patch("app.litellm.completion", side_effect=Exception("fail")):
+            client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        data = resp_json(client.get("/api/history"))
+        assert data["total"] == 0
 
 
 # ---------------------------------------------------------------------------

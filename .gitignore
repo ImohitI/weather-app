@@ -15,3 +15,6 @@ __pycache__/
 
 # Claude Code internal
 .claude/
+
+# SQLite database (created at runtime)
+history.db
