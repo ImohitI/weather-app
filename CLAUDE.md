@@ -159,7 +159,9 @@ Implemented on `POST /api/weather` only — the only endpoint that hits external
 - Limit: 10 requests per 60-second window per IP
 
 **Why sliding window over token bucket:**
-Token bucket resets the full quota every N seconds — a user can burn all 10 requests in 1 second, wait 59s, repeat. Sliding window tracks each timestamp individually so the quota rolls smoothly with no burst exploitation.
+Token bucket resets on the clock (T=0, T=60, T=120...). A user can send 10 requests at T=55–59, the bucket resets at T=60, and they send 10 more immediately — 20 requests in 6 seconds, neither window saw a violation. Sliding window always looks back exactly 60 seconds from *right now*, so those 10 requests at T=55 are still visible at T=61 and block the next attempt. No boundary exploit possible.
+
+This matters because your app calls Groq and OWM upstream. A burst of 20 requests in 6 seconds fires 20 LLM calls — Groq may rate-limit *your* account, not just the user.
 
 **Client IP extraction:**
 ```python
@@ -171,6 +173,15 @@ Behind Render's proxy, `REMOTE_ADDR` is always the proxy IP. `X-Forwarded-For` c
 **Response on limit exceeded:** `429 Too Many Requests` + `Retry-After: N` header. `N = int(timestamps[0] + RATE_WINDOW - now) + 1` — seconds until the oldest timestamp rolls out of the window.
 
 **Rate check is the first thing in `get_weather()`** — blocked requests do zero work (no body parsing, no cache lookup, no API calls).
+
+**`_is_rate_limited(ip)` step by step:**
+1. `now = time.time()`, `window_start = now - 60`
+2. `_rate_limit_store.get(ip, [])` → list of past timestamps (empty list for new IPs)
+3. List comprehension prunes anything `<= window_start` — lazy cleanup, no background thread
+4. `len >= 10` → blocked: compute `Retry-After = int(timestamps[0] + 60 - now) + 1`, save pruned list, **do not append** (blocked requests don't consume a slot), return `True`
+5. `len < 10` → allowed: append `now`, save, return `False`
+
+**Critical detail — no append on block:** if a spamming client's blocked requests consumed slots, their window would keep rolling forward and they'd never get a slot back. Blocked = turned away, not recorded.
 
 **Known limitation:** `_rate_limit_store` is in-process — not shared across gunicorn workers. Effective limit is `RATE_LIMIT × num_workers`. Fix: Redis atomic increment + TTL (same fix as caching, tracked in TODO #6).
 
