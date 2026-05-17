@@ -139,12 +139,12 @@ PROVIDER_MODELS = {
         ],
     },
     "openrouter": {
-        "default": "openrouter/meta-llama/llama-3.1-8b-instruct:free",
+        "default": "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
         "models": [
-            {"id": "openrouter/meta-llama/llama-3.1-8b-instruct:free",        "label": "Llama 3.1 8B"},
-            {"id": "openrouter/mistralai/mistral-7b-instruct:free",            "label": "Mistral 7B"},
-            {"id": "openrouter/google/gemma-3-1b-it:free",                     "label": "Gemma 3 1B"},
-            {"id": "openrouter/microsoft/phi-3-mini-128k-instruct:free",       "label": "Phi-3 Mini"},
+            {"id": "openrouter/nvidia/nemotron-3-super-120b-a12b:free",       "label": "Nemotron 120B"},
+            {"id": "openrouter/google/gemma-4-31b-it:free",                   "label": "Gemma 4 31B"},
+            {"id": "openrouter/liquid/lfm-2.5-1.2b-instruct:free",           "label": "LFM 2.5 1.2B"},
+            {"id": "openrouter/minimax/minimax-m2.5:free",                    "label": "MiniMax M2.5"},
         ],
     },
     "huggingface": {
