@@ -1,4 +1,5 @@
 import json
+import time
 import pytest
 from unittest.mock import MagicMock, patch
 import requests
@@ -14,6 +15,8 @@ from app import app, build_prompt, PROVIDER_MODELS
 @pytest.fixture
 def client():
     app.config["TESTING"] = True
+    app_module._weather_cache.clear()
+    app_module._llm_cache.clear()
     with app.test_client() as c:
         yield c
 
@@ -268,6 +271,103 @@ class TestProviderConfig:
         for provider, cfg in PROVIDER_MODELS.items():
             for m in cfg["models"]:
                 assert "id" in m and "label" in m, f"{provider} model missing id/label"
+
+
+# ---------------------------------------------------------------------------
+# Caching — two-tier (weather + LLM)
+# ---------------------------------------------------------------------------
+
+MOCK_WEATHER_2 = {
+    **MOCK_WEATHER,
+    "main": {**MOCK_WEATHER["main"], "temp": 30.0, "feels_like": 28.0},
+    "weather": [{"description": "clear sky", "icon": "01d"}],
+}
+
+class TestCaching:
+    # --- X-Cache header states ---
+
+    @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
+    @patch("app.fetch_weather", return_value=MOCK_WEATHER)
+    def test_first_request_is_miss(self, _weather, _llm, client):
+        resp = client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        assert resp.headers.get("X-Cache") == "MISS"
+
+    @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
+    @patch("app.fetch_weather", return_value=MOCK_WEATHER)
+    def test_second_request_same_provider_is_hit(self, _weather, _llm, client):
+        client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        resp = client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        assert resp.headers.get("X-Cache") == "HIT"
+
+    @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
+    @patch("app.fetch_weather", return_value=MOCK_WEATHER)
+    def test_different_provider_same_city_is_partial(self, _weather, _llm, client):
+        # Weather cached from groq request; LLM cache misses for huggingface key
+        client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        resp = client.post("/api/weather", json={"city": "London", "provider": "huggingface"})
+        assert resp.headers.get("X-Cache") == "PARTIAL"
+
+    # --- Call count guards ---
+
+    @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
+    @patch("app.fetch_weather", return_value=MOCK_WEATHER)
+    def test_full_hit_makes_zero_external_calls(self, mock_weather, mock_llm, client):
+        client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        assert mock_weather.call_count == 1
+        assert mock_llm.call_count == 1
+
+    @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
+    @patch("app.fetch_weather", return_value=MOCK_WEATHER)
+    def test_partial_hit_skips_weather_but_calls_llm(self, mock_weather, mock_llm, client):
+        client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        client.post("/api/weather", json={"city": "London", "provider": "huggingface"})
+        assert mock_weather.call_count == 1
+        assert mock_llm.call_count == 2
+
+    # --- Cache key properties ---
+
+    @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
+    @patch("app.fetch_weather", return_value=MOCK_WEATHER)
+    def test_weather_cache_key_is_case_insensitive(self, mock_weather, _llm, client):
+        client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        resp = client.post("/api/weather", json={"city": "LONDON", "provider": "groq"})
+        assert resp.headers.get("X-Cache") == "HIT"
+        assert mock_weather.call_count == 1
+
+    @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
+    @patch("app.fetch_weather", return_value=MOCK_WEATHER)
+    def test_different_cities_are_independent(self, mock_weather, _llm, client):
+        client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        resp = client.post("/api/weather", json={"city": "Paris", "provider": "groq"})
+        assert resp.headers.get("X-Cache") == "MISS"
+        assert mock_weather.call_count == 2
+
+    # --- Hash-based coherence ---
+
+    @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
+    @patch("app.fetch_weather")
+    def test_weather_change_invalidates_llm_cache(self, mock_weather, mock_llm, client):
+        # First request: conditions A → summary cached under hash_A
+        mock_weather.return_value = MOCK_WEATHER
+        client.post("/api/weather", json={"city": "London", "provider": "groq"})
+
+        # Weather changes → different hash → LLM cache must miss
+        mock_weather.return_value = MOCK_WEATHER_2
+        app_module._weather_cache.clear()  # force weather re-fetch
+        resp = client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        assert resp.headers.get("X-Cache") == "MISS"
+        assert mock_llm.call_count == 2
+
+    # --- TTL expiry ---
+
+    @patch("app.litellm.completion", return_value=MOCK_LLM_RESPONSE)
+    @patch("app.fetch_weather", return_value=MOCK_WEATHER)
+    def test_expired_weather_entry_triggers_fresh_fetch(self, mock_weather, _llm, client):
+        app_module._weather_cache["london"] = (MOCK_WEATHER, time.time() - 1)
+        resp = client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        assert resp.headers.get("X-Cache") == "MISS"
+        assert mock_weather.call_count == 1
 
 
 # ---------------------------------------------------------------------------

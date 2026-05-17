@@ -77,6 +77,39 @@ PROVIDER_MODELS = {
 - Sets `OPENWEATHER_API_KEY=dummy_key_for_tests` as env var — required because the app checks for the key before reaching mocked code; the actual value is never used in tests
 - Results visible at: github.com/ImohitI/weather-app → Actions tab
 
+## Caching strategy (two-tier, hash-based coherence)
+
+Two in-process dicts act as independent cache tiers. In production, both would be Redis.
+
+### Tier 1 — Weather data
+- **Key:** `city.lower()`
+- **TTL:** 10 minutes
+- **Why:** OpenWeatherMap is rate-limited; weather changes slowly
+
+### Tier 2 — LLM summary
+- **Key:** `city:provider:model:<weather_hash>`
+- **TTL:** 1 hour (generous, hash handles staleness)
+- **Why:** LLM calls are 10–20× slower and token-expensive
+
+### Weather hash
+`_weather_hash(weather)` MD5s only the five fields that appear in the prompt
+(`temp`, `feels_like`, `description`, `humidity`, `wind_speed`).
+This ties the summary to the exact conditions it was generated for — if weather
+changes, the hash changes and the LLM cache misses automatically. Stale summaries
+describing yesterday's rain during today's sunshine are impossible.
+
+### X-Cache response header
+| Value | Meaning |
+|---|---|
+| `MISS` | Both caches cold — weather API + LLM called |
+| `PARTIAL` | Weather cached, LLM miss — only LLM called (different provider/model) |
+| `HIT` | Both caches warm — zero external calls |
+
+### Known limitations (interview talking points)
+- **Cache stampede:** two concurrent requests for the same cold city both call the API. Fix: a per-key lock or "promise" pattern.
+- **Memory growth:** expired entries are only evicted on read. Fix: Redis with native TTL eviction.
+- **Single process:** in-process dicts are not shared across gunicorn workers. Fix: Redis (makes the app stateless and horizontally scalable — see TODO item #6).
+
 ## Key decisions made during development
 - **Dropped Claude/OpenAI/Gemini** — replaced with free providers (Groq, HuggingFace, OpenRouter)
 - **Gemini free tier unavailable** in some regions (India) — limit shows as 0

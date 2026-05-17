@@ -1,4 +1,7 @@
 import os
+import time
+import json
+import hashlib
 import requests
 import litellm
 from flask import Flask, jsonify, render_template, request
@@ -7,6 +10,43 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
+
+# Two-tier cache
+# Tier 1 — raw weather data: city.lower() -> (weather_dict, expires_at)
+_weather_cache: dict = {}
+CACHE_TTL = 600       # 10 minutes
+
+# Tier 2 — LLM summaries: "city:provider:model:weather_hash" -> (summary, expires_at)
+# Hash-based key means a weather change automatically invalidates the summary.
+_llm_cache: dict = {}
+LLM_CACHE_TTL = 3600  # 1 hour (hash handles coherence; TTL handles memory)
+
+
+def _cache_get(cache: dict, key: str):
+    entry = cache.get(key)
+    if not entry:
+        return None
+    value, expires_at = entry
+    if time.time() > expires_at:
+        del cache[key]
+        return None
+    return value
+
+
+def _cache_set(cache: dict, key: str, value, ttl: int):
+    cache[key] = (value, time.time() + ttl)
+
+
+def _weather_hash(weather: dict) -> str:
+    """Short hash of the fields that appear in the LLM prompt."""
+    relevant = {
+        "temp":        weather["main"]["temp"],
+        "feels_like":  weather["main"]["feels_like"],
+        "description": weather["weather"][0]["description"],
+        "humidity":    weather["main"]["humidity"],
+        "wind_speed":  weather["wind"]["speed"],
+    }
+    return hashlib.md5(json.dumps(relevant, sort_keys=True).encode()).hexdigest()[:8]
 
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 
@@ -97,31 +137,52 @@ def get_weather():
     if not OPENWEATHER_API_KEY:
         return jsonify({"error": "OPENWEATHER_API_KEY is not set"}), 500
 
-    # 1. Fetch real weather data
-    try:
-        weather = fetch_weather(city)
-    except requests.HTTPError as exc:
-        code = exc.response.status_code
-        if code == 404:
-            return jsonify({"error": f"City '{city}' not found"}), 404
-        if code == 401:
-            return jsonify({"error": "Invalid OpenWeatherMap API key"}), 401
-        return jsonify({"error": "Weather service error"}), 502
-    except requests.RequestException:
-        return jsonify({"error": "Could not reach weather service"}), 502
+    # Tier 1 — weather data (keyed by city)
+    weather = _cache_get(_weather_cache, city.lower())
+    weather_hit = weather is not None
 
-    # 2. Ask the selected LLM to summarise it
-    try:
-        llm_resp = litellm.completion(
-            model=model_id,
-            messages=[{"role": "user", "content": build_prompt(weather, city)}],
-            max_tokens=200,
-        )
-        summary = llm_resp.choices[0].message.content.strip()
-    except Exception as exc:  # litellm raises various provider-specific errors
-        return jsonify({"error": f"LLM error ({provider}): {exc}"}), 502
+    if not weather_hit:
+        try:
+            weather = fetch_weather(city)
+            _cache_set(_weather_cache, city.lower(), weather, CACHE_TTL)
+        except requests.HTTPError as exc:
+            code = exc.response.status_code
+            if code == 404:
+                return jsonify({"error": f"City '{city}' not found"}), 404
+            if code == 401:
+                return jsonify({"error": "Invalid OpenWeatherMap API key"}), 401
+            return jsonify({"error": "Weather service error"}), 502
+        except requests.RequestException:
+            return jsonify({"error": "Could not reach weather service"}), 502
 
-    return jsonify({
+    # Tier 2 — LLM summary (keyed by city + provider + model + weather hash)
+    # Weather hash ties the summary to the exact conditions it was generated for.
+    # If weather changes, the hash changes and this key misses automatically.
+    llm_key = f"{city.lower()}:{provider}:{model_id}:{_weather_hash(weather)}"
+    summary = _cache_get(_llm_cache, llm_key)
+    llm_hit = summary is not None
+
+    if not llm_hit:
+        try:
+            llm_resp = litellm.completion(
+                model=model_id,
+                messages=[{"role": "user", "content": build_prompt(weather, city)}],
+                max_tokens=200,
+            )
+            summary = llm_resp.choices[0].message.content.strip()
+            _cache_set(_llm_cache, llm_key, summary, LLM_CACHE_TTL)
+        except Exception as exc:  # litellm raises various provider-specific errors
+            return jsonify({"error": f"LLM error ({provider}): {exc}"}), 502
+
+    # HIT = zero external calls | PARTIAL = only LLM called | MISS = both called
+    if weather_hit and llm_hit:
+        cache_status = "HIT"
+    elif weather_hit:
+        cache_status = "PARTIAL"
+    else:
+        cache_status = "MISS"
+
+    resp = jsonify({
         "city": weather["name"],
         "country": weather["sys"]["country"],
         "temp": round(weather["main"]["temp"], 1),
@@ -134,6 +195,8 @@ def get_weather():
         "provider": provider,
         "model_id": model_id,
     })
+    resp.headers["X-Cache"] = cache_status
+    return resp
 
 
 if __name__ == "__main__":
