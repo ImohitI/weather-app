@@ -143,6 +143,36 @@ class TestWeatherValidation:
 
 
 # ---------------------------------------------------------------------------
+# POST /api/weather — missing provider API keys
+# ---------------------------------------------------------------------------
+
+class TestProviderApiKeys:
+    @patch.object(app_module, "GROQ_API_KEY", None)
+    def test_missing_groq_key_returns_500(self, client):
+        resp = client.post("/api/weather", json={"city": "London", "provider": "groq"})
+        assert resp.status_code == 500
+        assert "GROQ_API_KEY" in resp_json(resp)["error"]
+
+    @patch.object(app_module, "OPENROUTER_API_KEY", None)
+    def test_missing_openrouter_key_returns_500(self, client):
+        resp = client.post("/api/weather", json={"city": "London", "provider": "openrouter"})
+        assert resp.status_code == 500
+        assert "OPENROUTER_API_KEY" in resp_json(resp)["error"]
+
+    @patch.object(app_module, "HUGGINGFACE_API_KEY", None)
+    def test_missing_huggingface_key_returns_500(self, client):
+        resp = client.post("/api/weather", json={"city": "London", "provider": "huggingface"})
+        assert resp.status_code == 500
+        assert "HUGGINGFACE_API_KEY" in resp_json(resp)["error"]
+
+    @patch.object(app_module, "OPENROUTER_API_KEY", None)
+    def test_missing_openrouter_key_does_not_call_weather_api(self, client):
+        with patch("app.fetch_weather") as mock_weather:
+            client.post("/api/weather", json={"city": "London", "provider": "openrouter"})
+            mock_weather.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # POST /api/weather — happy path
 # ---------------------------------------------------------------------------
 

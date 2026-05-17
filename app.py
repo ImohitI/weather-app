@@ -117,6 +117,16 @@ def _weather_hash(weather: dict) -> str:
     return hashlib.md5(json.dumps(relevant, sort_keys=True).encode()).hexdigest()[:8]
 
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+GROQ_API_KEY        = os.getenv("GROQ_API_KEY")
+OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY")
+HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
+
+# Maps provider name → the env var name expected, used in error messages
+PROVIDER_KEY_NAMES = {
+    "groq":        "GROQ_API_KEY",
+    "openrouter":  "OPENROUTER_API_KEY",
+    "huggingface": "HUGGINGFACE_API_KEY",
+}
 
 PROVIDER_MODELS = {
     "groq": {
@@ -252,6 +262,14 @@ def get_weather():
 
     if not OPENWEATHER_API_KEY:
         return jsonify({"error": "OPENWEATHER_API_KEY is not set"}), 500
+
+    provider_api_key = {
+        "groq":        GROQ_API_KEY,
+        "openrouter":  OPENROUTER_API_KEY,
+        "huggingface": HUGGINGFACE_API_KEY,
+    }[provider]
+    if not provider_api_key:
+        return jsonify({"error": f"{PROVIDER_KEY_NAMES[provider]} is not set"}), 500
 
     # Tier 1 — weather data (keyed by city)
     weather = _cache_get(_weather_cache, city.lower())
