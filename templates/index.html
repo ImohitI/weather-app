@@ -51,10 +51,7 @@
       background: transparent;
       transition: all .2s;
     }
-    .provider-btn.active { color: #fff; }
-    .provider-btn[data-p="groq"].active       { background: #f55036; }
-    .provider-btn[data-p="openrouter"].active { background: #7c3aed; }
-    .provider-btn[data-p="huggingface"].active { background: #ff9a00; }
+    .provider-btn.active { color: #fff; background: var(--provider-color, #555); }
 
     /* Model selector */
     .model-select {
@@ -166,11 +163,11 @@
 <div class="card">
   <h1>🌤 AI Weather</h1>
 
-  <!-- Provider selector -->
+  <!-- Provider selector — rendered from the providers the backend actually has keys/tokens for -->
   <div class="providers">
-    <button class="provider-btn active" data-p="groq">Groq</button>
-    <button class="provider-btn" data-p="openrouter">OpenRouter</button>
-    <button class="provider-btn" data-p="huggingface">HuggingFace</button>
+    {% for p in providers %}
+    <button class="provider-btn{% if loop.first %} active{% endif %}" data-p="{{ p.id }}" style="--provider-color: {{ p.color }}">{{ p.label }}</button>
+    {% endfor %}
   </div>
 
   <!-- Model selector -->
@@ -220,7 +217,7 @@
 </div>
 
 <script>
-  let activeProvider = "groq";
+  let activeProvider = document.querySelector(".provider-btn.active")?.dataset.p;
   let providerModels = {};
 
   async function loadModels() {

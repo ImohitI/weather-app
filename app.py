@@ -3,10 +3,12 @@ import time
 import json
 import sqlite3
 import hashlib
+import asyncio
 import requests
 import litellm
 from flask import Flask, jsonify, render_template, request
 from dotenv import load_dotenv
+from claude_agent_sdk import query as claude_query, ClaudeAgentOptions, ResultMessage
 
 load_dotenv()
 
@@ -116,21 +118,50 @@ def _weather_hash(weather: dict) -> str:
     }
     return hashlib.md5(json.dumps(relevant, sort_keys=True).encode()).hexdigest()[:8]
 
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
-GROQ_API_KEY        = os.getenv("GROQ_API_KEY")
-OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY")
-HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
+OPENWEATHER_API_KEY     = os.getenv("OPENWEATHER_API_KEY")
+GROQ_API_KEY            = os.getenv("GROQ_API_KEY")
+OPENROUTER_API_KEY      = os.getenv("OPENROUTER_API_KEY")
+HUGGINGFACE_API_KEY     = os.getenv("HUGGINGFACE_API_KEY")
+ANTHROPIC_API_KEY       = os.getenv("ANTHROPIC_API_KEY")
+CLAUDE_CODE_OAUTH_TOKEN = os.getenv("CLAUDE_CODE_OAUTH_TOKEN")
 
 # Maps provider name → the env var name expected, used in error messages
 PROVIDER_KEY_NAMES = {
     "groq":        "GROQ_API_KEY",
     "openrouter":  "OPENROUTER_API_KEY",
     "huggingface": "HUGGINGFACE_API_KEY",
+    "anthropic":   "ANTHROPIC_API_KEY",
+    "claude-pro":  "CLAUDE_CODE_OAUTH_TOKEN",
+}
+
+# Display metadata for provider buttons, rendered server-side in index.html
+# so a provider only ever appears in the UI when it's actually usable.
+PROVIDER_DISPLAY = {
+    "groq":        {"label": "Groq",         "color": "#f55036"},
+    "openrouter":  {"label": "OpenRouter",   "color": "#7c3aed"},
+    "huggingface": {"label": "HuggingFace",  "color": "#ff9a00"},
+    "anthropic":   {"label": "Claude",       "color": "#d97757"},
+    "claude-pro":  {"label": "Claude (Pro)", "color": "#b45309"},
 }
 
 _MODELS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models.json")
 with open(_MODELS_PATH) as _f:
     PROVIDER_MODELS: dict = json.load(_f)
+
+def _gate_claude_pro(models: dict, oauth_token: str | None) -> None:
+    """"claude-pro" runs through the Claude Agent SDK authenticated via
+    CLAUDE_CODE_OAUTH_TOKEN, which spends the developer's personal Claude
+    Pro/Max subscription quota rather than a standalone metered API key.
+    That's fine for local development but must never be reachable on the
+    public deployment — so the provider only exists in PROVIDER_MODELS (and
+    therefore in /api/models, the UI, and /api/weather) when the token is
+    actually present. Never set CLAUDE_CODE_OAUTH_TOKEN in the Render
+    dashboard."""
+    if not oauth_token:
+        models.pop("claude-pro", None)
+
+
+_gate_claude_pro(PROVIDER_MODELS, CLAUDE_CODE_OAUTH_TOKEN)
 
 
 def fetch_weather(city: str) -> dict:
@@ -157,9 +188,28 @@ def build_prompt(data: dict, city: str) -> str:
     )
 
 
+def _claude_pro_completion(prompt: str, model: str) -> str:
+    """Generate a summary via the Claude Agent SDK, billed to the developer's
+    Claude Pro/Max subscription (CLAUDE_CODE_OAUTH_TOKEN) instead of a metered
+    API key. tools=[] disables all tool access (no bash/file/web) since this
+    only needs a single piece of generated text from an untrusted city name."""
+    options = ClaudeAgentOptions(model=model, tools=[], max_turns=1)
+
+    async def _run() -> str:
+        async for message in claude_query(prompt=prompt, options=options):
+            if isinstance(message, ResultMessage) and message.result:
+                return message.result
+        raise RuntimeError("Claude Agent SDK returned no result")
+
+    return asyncio.run(_run())
+
+
 @app.route("/")
 def index():
-    return render_template("index.html")
+    providers = [
+        {"id": p, **PROVIDER_DISPLAY[p]} for p in PROVIDER_MODELS if p in PROVIDER_DISPLAY
+    ]
+    return render_template("index.html", providers=providers)
 
 
 @app.route("/api/history")
@@ -242,6 +292,8 @@ def get_weather():
         "groq":        GROQ_API_KEY,
         "openrouter":  OPENROUTER_API_KEY,
         "huggingface": HUGGINGFACE_API_KEY,
+        "anthropic":   ANTHROPIC_API_KEY,
+        "claude-pro":  CLAUDE_CODE_OAUTH_TOKEN,
     }[provider]
     if not provider_api_key:
         return jsonify({"error": f"{PROVIDER_KEY_NAMES[provider]} is not set"}), 500
@@ -273,12 +325,15 @@ def get_weather():
 
     if not llm_hit:
         try:
-            llm_resp = litellm.completion(
-                model=model_id,
-                messages=[{"role": "user", "content": build_prompt(weather, city)}],
-                max_tokens=200,
-            )
-            summary = llm_resp.choices[0].message.content.strip()
+            if provider == "claude-pro":
+                summary = _claude_pro_completion(build_prompt(weather, city), model_id).strip()
+            else:
+                llm_resp = litellm.completion(
+                    model=model_id,
+                    messages=[{"role": "user", "content": build_prompt(weather, city)}],
+                    max_tokens=200,
+                )
+                summary = llm_resp.choices[0].message.content.strip()
             _cache_set(_llm_cache, llm_key, summary, LLM_CACHE_TTL)
         except Exception as exc:  # litellm raises various provider-specific errors
             return jsonify({"error": f"LLM error ({provider}): {exc}"}), 502

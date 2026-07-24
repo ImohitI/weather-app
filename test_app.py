@@ -165,11 +165,73 @@ class TestProviderApiKeys:
         assert resp.status_code == 500
         assert "HUGGINGFACE_API_KEY" in resp_json(resp)["error"]
 
+    @patch.object(app_module, "ANTHROPIC_API_KEY", None)
+    def test_missing_anthropic_key_returns_500(self, client):
+        resp = client.post("/api/weather", json={"city": "London", "provider": "anthropic"})
+        assert resp.status_code == 500
+        assert "ANTHROPIC_API_KEY" in resp_json(resp)["error"]
+
     @patch.object(app_module, "OPENROUTER_API_KEY", None)
     def test_missing_openrouter_key_does_not_call_weather_api(self, client):
         with patch("app.fetch_weather") as mock_weather:
             client.post("/api/weather", json={"city": "London", "provider": "openrouter"})
             mock_weather.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# claude-pro provider — gated behind CLAUDE_CODE_OAUTH_TOKEN, must never be
+# reachable unless the token is present (see app.py comment on PROVIDER_MODELS)
+# ---------------------------------------------------------------------------
+
+class TestClaudeProGating:
+    # These test the gating function directly, in isolation from ambient
+    # environment state — a dev machine's real .env may genuinely have
+    # CLAUDE_CODE_OAUTH_TOKEN set, so asserting against module-level
+    # PROVIDER_MODELS here would be flaky (and, worse, a test that posts
+    # provider="claude-pro" while the token really is present would fire a
+    # real Claude Agent SDK call instead of staying mocked).
+    def test_removes_claude_pro_without_token(self):
+        models = {"claude-pro": {"default": "sonnet", "models": []}, "groq": {}}
+        app_module._gate_claude_pro(models, None)
+        assert "claude-pro" not in models
+
+    def test_keeps_claude_pro_with_token(self):
+        models = {"claude-pro": {"default": "sonnet", "models": []}, "groq": {}}
+        app_module._gate_claude_pro(models, "dummy-oauth-token")
+        assert "claude-pro" in models
+
+    @patch.object(app_module, "PROVIDER_MODELS", {"groq": PROVIDER_MODELS["groq"]})
+    def test_unreachable_via_api_weather_when_not_in_provider_models(self, client):
+        resp = client.post("/api/weather", json={"city": "London", "provider": "claude-pro"})
+        assert resp.status_code == 400
+        assert "claude-pro" in resp_json(resp)["error"]
+
+
+_CLAUDE_PRO_MODELS = {
+    **PROVIDER_MODELS,
+    "claude-pro": {"default": "sonnet", "models": [{"id": "sonnet", "label": "Claude Sonnet 5"}]},
+}
+
+
+class TestClaudeProCompletion:
+    @patch.object(app_module, "PROVIDER_MODELS", _CLAUDE_PRO_MODELS)
+    @patch.object(app_module, "CLAUDE_CODE_OAUTH_TOKEN", "dummy-oauth-token")
+    @patch("app._claude_pro_completion", return_value="Sunny and mild in London.")
+    @patch("app.fetch_weather", return_value=MOCK_WEATHER)
+    def test_uses_claude_agent_sdk_not_litellm(self, _weather, mock_completion, client):
+        with patch("app.litellm.completion") as mock_litellm:
+            resp = client.post("/api/weather", json={"city": "London", "provider": "claude-pro"})
+        assert resp.status_code == 200
+        mock_completion.assert_called_once()
+        mock_litellm.assert_not_called()
+        assert resp_json(resp)["summary"] == "Sunny and mild in London."
+
+    @patch.object(app_module, "PROVIDER_MODELS", {"claude-pro": _CLAUDE_PRO_MODELS["claude-pro"]})
+    @patch.object(app_module, "CLAUDE_CODE_OAUTH_TOKEN", None)
+    def test_missing_token_returns_500(self, client):
+        resp = client.post("/api/weather", json={"city": "London", "provider": "claude-pro"})
+        assert resp.status_code == 500
+        assert "CLAUDE_CODE_OAUTH_TOKEN" in resp_json(resp)["error"]
 
 
 # ---------------------------------------------------------------------------

@@ -12,14 +12,14 @@ weather-app/
 ├── app.py                 ← Flask backend: weather fetch + multi-LLM routing
 ├── models.json            ← provider + model config (edit here, not in app.py)
 ├── update_models.py       ← maintenance script: discover + live-test free models, rewrite models.json
-├── requirements.txt       ← flask, requests, litellm, python-dotenv, gunicorn
-├── test_app.py            ← 63 unit tests (mocked, no API calls needed)
+├── requirements.txt       ← flask, requests, litellm, claude-agent-sdk, python-dotenv, gunicorn
+├── test_app.py            ← 69 unit tests (mocked, no API calls needed)
 ├── .env.example           ← template for API keys (copy → .env)
 ├── .env                   ← actual keys (gitignored, never commit)
 ├── .gitignore             ← excludes .env, venv/, __pycache__, .claude/
 ├── .github/
 │   └── workflows/
-│       └── tests.yml      ← GitHub Actions: runs 63 unit tests on every push to main
+│       └── tests.yml      ← GitHub Actions: runs 69 unit tests on every push to main
 └── templates/
     └── index.html         ← dark glassmorphism UI, provider + model switcher
 ```
@@ -44,6 +44,9 @@ python -m pytest test_app.py -v
 - `GROQ_API_KEY` — free at console.groq.com (recommended, no credit card)
 - `HUGGINGFACE_API_KEY` — free at huggingface.co/settings/tokens
 - `OPENROUTER_API_KEY` — free models at openrouter.ai
+- `ANTHROPIC_API_KEY` — paid, from console.anthropic.com (Claude models)
+
+Note: `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) is **not** a substitute for `ANTHROPIC_API_KEY` — it authenticates the Claude Code CLI itself, not general Anthropic API access, and `litellm` won't accept it.
 
 ## Architecture
 1. Frontend POSTs `{ city, provider, model }` to `/api/weather`
@@ -92,8 +95,8 @@ Neither side knows how the other is implemented. Rule: **secrets + shared state 
 ### Phase 1 — Page load
 | Step | What happens |
 |---|---|
-| `GET /` | Flask `index()` returns rendered `index.html` via Jinja2 |
-| Script executes | JS initializes `activeProvider = "groq"`, attaches event listeners |
+| `GET /` | Flask `index()` builds `providers` (id/label/color) from `PROVIDER_MODELS ∩ PROVIDER_DISPLAY` and renders `index.html` via Jinja2 — provider buttons are generated server-side, so a provider that isn't usable in this environment (e.g. `claude-pro` without a token) never appears in the HTML at all |
+| Script executes | JS reads `activeProvider` off the first `.provider-btn.active` in the DOM, attaches event listeners |
 | `GET /api/models` | JS fires immediately; backend reshapes `PROVIDER_MODELS` dict → JSON |
 | Dropdown populated | JS stores response in `providerModels`, builds `<select>` options |
 
@@ -138,7 +141,9 @@ Current verified working models:
 groq:        Llama 3.3 70B (default), Llama 3.1 8B, Llama 4 Scout, Qwen3 32B
 openrouter:  Nemotron 120B (default), Gemma 4 31B, LFM 2.5 1.2B, MiniMax M2.5
 huggingface: Qwen 2.5 7B (default), Gemma 2 2B, Llama 3.2 1B
+anthropic:   Claude Sonnet 5 (default), Claude Haiku 4.5, Claude Opus 4.8
 ```
+Anthropic is paid (no free tier) and is not covered by `update_models.py`'s live-test flow — model IDs were added by hand and should be spot-checked against console.anthropic.com if calls start failing.
 
 `litellm` handles the unified interface — reads API keys from env automatically.
 
@@ -154,22 +159,47 @@ git add models.json && git commit -m "refresh model list" && git push
 
 ### Per-provider API key validation
 
-`app.py` loads all four keys at module level and checks the selected provider's key before touching any cache or making any API call:
+`app.py` loads all keys at module level and checks the selected provider's key before touching any cache or making any API call:
 
 ```python
-GROQ_API_KEY        = os.getenv("GROQ_API_KEY")
-OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY")
-HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
+GROQ_API_KEY            = os.getenv("GROQ_API_KEY")
+OPENROUTER_API_KEY      = os.getenv("OPENROUTER_API_KEY")
+HUGGINGFACE_API_KEY     = os.getenv("HUGGINGFACE_API_KEY")
+ANTHROPIC_API_KEY       = os.getenv("ANTHROPIC_API_KEY")
+CLAUDE_CODE_OAUTH_TOKEN = os.getenv("CLAUDE_CODE_OAUTH_TOKEN")
 ```
 
 If a key is missing the response is `500: OPENROUTER_API_KEY is not set` (naming the exact variable) rather than a cryptic litellm 502. Check order in `get_weather()`: rate limit → OPENWEATHER key → provider key → cache → fetch.
 
+### `claude-pro` — Claude via the Agent SDK, local dev only
+
+Every other provider (including `anthropic`) goes through `litellm` and a standalone, metered API key. `claude-pro` is different: it calls Claude through the **Claude Agent SDK** (`claude_agent_sdk.query()`), authenticated with `CLAUDE_CODE_OAUTH_TOKEN` — the same OAuth token minted by `claude setup-token` that the Claude Code CLI itself uses. That token spends the developer's **personal Claude Pro/Max subscription quota**, not a separate API budget.
+
+Because this app has a public live URL, `claude-pro` must never be reachable by the public deployment — every visitor who used it would be spending the developer's personal subscription, and Anthropic's consumer subscription terms scope Pro/Max usage to personal use through official surfaces, not as a backend inference service for arbitrary third-party traffic.
+
+**How it's gated — presence of the token, not a separate flag:**
+```python
+def _gate_claude_pro(models: dict, oauth_token: str | None) -> None:
+    if not oauth_token:
+        models.pop("claude-pro", None)
+
+_gate_claude_pro(PROVIDER_MODELS, CLAUDE_CODE_OAUTH_TOKEN)
+```
+This runs once at import time. If `CLAUDE_CODE_OAUTH_TOKEN` isn't set, `claude-pro` is removed from `PROVIDER_MODELS` entirely — invisible to `/api/models`, absent from the server-rendered provider buttons (see `PROVIDER_DISPLAY` / `index()`), and any request naming it explicitly gets `400: Unknown provider 'claude-pro'`, same as any other nonexistent provider. **Never set `CLAUDE_CODE_OAUTH_TOKEN` in the Render dashboard** — that's the entire enforcement mechanism, same pattern as every other key being "set in Render dashboard (never in code)."
+
+**Why it's a different code path, not just another litellm model string:** the Agent SDK doesn't speak the Anthropic Messages API directly — it shells out to the `claude` CLI binary as a subprocess (inherits `os.environ`, so `load_dotenv()` already makes the token visible to it) and runs a full agent turn. `_claude_pro_completion()` in `app.py` sets `tools=[]` to disable all tool access (no bash/file/web) since the prompt embeds a user-supplied city name and this only needs one piece of generated text back, then extracts the final `ResultMessage.result`. `query()` is async; `get_weather()` is a sync Flask view, so it's bridged with `asyncio.run()`. Each call pays CLI-startup latency (a real subprocess spin-up) rather than a single HTTP round-trip — noticeably slower than the other providers.
+
+**Model IDs are aliases, not dated snapshots:** `models.json`'s `claude-pro` entry uses `"sonnet" / "haiku" / "opus"` — the Claude Code CLI's `--model` aliases that always resolve to the latest matching model — rather than the dated model strings the `anthropic` (litellm) entry uses. `update_models.py` does not cover this provider; it was added by hand and isn't live-tested in CI.
+
+**Testing:** `test_app.py::TestClaudeProGating` tests `_gate_claude_pro()` directly with synthetic dicts rather than asserting on the real `PROVIDER_MODELS`/`CLAUDE_CODE_OAUTH_TOKEN` — a dev machine's `.env` may genuinely have the token set, which would make an ambient-state assertion flaky and, worse, could let a test actually fire a real Agent SDK call. `TestClaudeProCompletion` explicitly patches `PROVIDER_MODELS` and mocks `app._claude_pro_completion` so the real CLI is never invoked in CI or local test runs.
+
 ## CI — GitHub Actions
 - Workflow at `.github/workflows/tests.yml`
 - Triggers on every push and pull request to `main`
-- Runs `python -m pytest test_app.py -v` (63 tests)
+- Runs `python -m pytest test_app.py -v` (69 tests)
 - Sets `OPENWEATHER_API_KEY=dummy_key_for_tests` as env var — required because the app checks for the key before reaching mocked code; the actual value is never used in tests
 - `models.json` is committed to the repo so CI can load `PROVIDER_MODELS` at import time without any API calls
+- Deliberately does **not** set `CLAUDE_CODE_OAUTH_TOKEN` — CI should exercise the same gated-off state as the public Render deployment, so `claude-pro` stays absent from `PROVIDER_MODELS` during the test run (see `_gate_claude_pro` in the `claude-pro` section above)
 - Results visible at: github.com/ImohitI/weather-app → Actions tab
 
 ## Database design (SQLite, query history)
@@ -292,6 +322,7 @@ describing yesterday's rain during today's sunshine are impossible.
 
 ## Key decisions made during development
 - **Dropped Claude/OpenAI/Gemini** — replaced with free providers (Groq, HuggingFace, OpenRouter)
+- **Re-added Claude (2026-07-24)** — first as a paid `anthropic` provider via `ANTHROPIC_API_KEY` (litellm, wired like the other three). Then added a second, separate `claude-pro` provider on the same day that instead goes through the Claude Agent SDK authenticated with `CLAUDE_CODE_OAUTH_TOKEN` (the developer's personal Claude Pro subscription quota, not a metered key) — gated to only exist when that token is present, so it's local-dev-only and never reachable on the public Render deployment. See the `claude-pro` section under "LLM providers and models" for the full rationale. Neither provider's model IDs are live-tested with a real key yet; see Testing report.
 - **Gemini free tier unavailable** in some regions (India) — limit shows as 0
 - **Groq model changes** — Mixtral 8x7B, Gemma2 9B, DeepSeek R1, QwQ 32B all decommissioned; replaced with active models verified via Groq API
 - **HuggingFace model selection** — many models not chat-compatible; Qwen2.5-7B, Gemma-2-2B, Llama-3.2-1B confirmed working
@@ -331,6 +362,9 @@ Render picks up the push and redeploys automatically.
 | OpenRouter | Gemma 4 31B | ✅ |
 | OpenRouter | LFM 2.5 1.2B | ✅ |
 | OpenRouter | MiniMax M2.5 | ✅ |
+| Anthropic | Claude Sonnet 5 | ⏳ not yet live-tested — needs a real `ANTHROPIC_API_KEY` |
+| Anthropic | Claude Haiku 4.5 | ⏳ not yet live-tested — needs a real `ANTHROPIC_API_KEY` |
+| Anthropic | Claude Opus 4.8 | ⏳ not yet live-tested — needs a real `ANTHROPIC_API_KEY` |
 
 ## Potential next steps
 - Add history UI panel (backend `/api/history` exists, no frontend for it yet)

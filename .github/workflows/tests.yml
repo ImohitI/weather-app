@@ -28,4 +28,5 @@ jobs:
           GROQ_API_KEY: dummy_key_for_tests
           OPENROUTER_API_KEY: dummy_key_for_tests
           HUGGINGFACE_API_KEY: dummy_key_for_tests
+          ANTHROPIC_API_KEY: dummy_key_for_tests
         run: python -m pytest test_app.py -v
